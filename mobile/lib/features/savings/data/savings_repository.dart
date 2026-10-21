@@ -200,6 +200,50 @@ class SavingsRepository {
     }
   }
 
+  /// Submits a signed trustline XDR envelope to the backend with targeted
+  /// error mapping for trustline-specific activation failures.
+  ///
+  /// Posts to `/api/transactions/submit` and maps error responses (such as
+  /// HTTP 422 or specific trustline failure codes) to appropriate exceptions
+  /// or delegates to [submitSignedXdr].
+  Future<String> submitTrustlineXdr(String signedXdr) async {
+    submissionStatus.value = SavingsSubmissionStatus.submitting;
+    try {
+      final response = await _apiClient.postWithRetry(
+        '$_baseUrl/api/transactions/submit',
+        {'signedXdr': signedXdr},
+      );
+
+      final hash = response['hash'] as String?;
+      if (hash == null || hash.isEmpty) {
+        throw const TransactionFailedException(
+          'The network accepted the trustline transaction but did not return a transaction hash.',
+        );
+      }
+
+      submissionStatus.value = SavingsSubmissionStatus.succeeded;
+      return hash;
+    } on ApiRequestException catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      if (error.statusCode == 422) {
+        throw TransactionFailedException(
+          'Trustline activation failed: ${error.message}',
+          statusCode: error.statusCode,
+          cause: error,
+        );
+      }
+      rethrow;
+    } on ApiException {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      rethrow;
+    } catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      throw TransactionFailedException(
+        'Failed to submit the trustline transaction. Please try again.',
+        cause: error,
+      );
+    }
+  }
   /// Reverts the submission state to idle so the user can attempt the action
   /// again without being stuck in a looping "pending" state.
   void resetSubmissionState() {
