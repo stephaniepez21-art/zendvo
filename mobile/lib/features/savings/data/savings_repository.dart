@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_exceptions.dart';
@@ -31,8 +33,10 @@ class SavingsRepository {
   SavingsRepository({
     ApiClient? apiClient,
     String? baseUrl,
+    http.Client? client,
   })  : _apiClient = apiClient ?? ApiClient(),
-        _baseUrl = baseUrl ?? defaultBaseUrl;
+        _baseUrl = baseUrl ?? defaultBaseUrl,
+        httpClient = client ?? http.Client();
 
   /// Backend base URL; override with `--dart-define=API_BASE_URL=...`.
   static const String defaultBaseUrl = String.fromEnvironment(
@@ -42,6 +46,7 @@ class SavingsRepository {
 
   final ApiClient _apiClient;
   final String _baseUrl;
+  final http.Client httpClient;
 
   /// Observable submission state. Listen to this to drive button/loading
   /// state and to reset out of a pending state on failure.
@@ -62,7 +67,7 @@ class SavingsRepository {
         {'amount': amount, 'accountId': accountId},
       );
 
-      final xdr = response['xdr'] as String?;
+      final xdr = response['xdr'] as String? ?? response['unsignedXdr'] as String?;
       if (xdr == null || xdr.isEmpty) {
         throw const TransactionFailedException(
           'The network accepted the request but did not return a deposit XDR.',
@@ -70,19 +75,12 @@ class SavingsRepository {
       }
       return xdr;
     } catch (e) {
-      // Re-throw domain exceptions so the UI controller can catch and handle
-      // them properly, keeping app state from looping in "pending".
       rethrow;
     }
   }
 
   /// Requests an unsigned withdrawal XDR envelope from the backend for the
   /// given [amount] and [accountId].
-  ///
-  /// Domain exceptions from [ApiClient.postWithRetry] (e.g.
-  /// [TransactionFailedException], [NetworkCongestedException]) are
-  /// rethrown so the caller/UI controller can handle them; this keeps app
-  /// state from getting stuck after a permanent failure.
   Future<String> requestWithdrawalXdr(String amount, String accountId) async {
     try {
       final response = await _apiClient.postWithRetry(
@@ -98,20 +96,12 @@ class SavingsRepository {
       }
       return unsignedxdr;
     } catch (e) {
-      // Re-throw domain exceptions so the UI controller can catch and handle
-      // them properly, keeping app state from looping in "pending".
       rethrow;
     }
   }
 
   /// Submits a signed XDR envelope to the backend relay with automatic
   /// retries for transient network failures.
-  ///
-  /// On success returns the on-chain transaction hash and flips the
-  /// submission state to [SavingsSubmissionStatus.succeeded]. On permanent
-  /// failure the state reverts to [SavingsSubmissionStatus.failed] and the
-  /// mapped domain exception is rethrown so the caller can inform the user;
-  /// call [resetSubmissionState] before attempting the action again.
   Future<String> submitSignedXdr(String signedXdr) async {
     submissionStatus.value = SavingsSubmissionStatus.submitting;
     try {
@@ -141,25 +131,6 @@ class SavingsRepository {
 
   /// Submits a signed withdrawal XDR envelope to the backend with targeted
   /// error mapping for withdrawal-specific failure conditions.
-  ///
-  /// Unlike [submitSignedXdr] (which is a generic relay), this method posts
-  /// to the same `/api/transactions/submit` endpoint but interprets the
-  /// response in the context of a withdrawal operation:
-  ///
-  /// - HTTP 422 → [InsufficientVaultFundsException]: the vault does not hold
-  ///   enough shares or USDC to honour the requested withdrawal amount.  The
-  ///   UI can surface a targeted message (e.g. "Insufficient vault funds –
-  ///   try a smaller amount") rather than a generic network error.
-  /// - HTTP 400 → [TransactionFailedException]: the XDR was rejected by the
-  ///   network (bad signature, invalid sequence number, etc.).
-  /// - HTTP 503/5xx after retries → [NetworkCongestedException]: surfaced by
-  ///   [ApiClient.postWithRetry] after exhausting its backoff strategy.
-  ///
-  /// On success, the on-chain transaction hash is returned and
-  /// [submissionStatus] transitions to [SavingsSubmissionStatus.succeeded].
-  /// On any permanent failure the status reverts to
-  /// [SavingsSubmissionStatus.failed] so the UI is never stuck in a pending
-  /// loop; call [resetSubmissionState] before letting the user retry.
   Future<String> submitWithdrawalXdr(String signedXdr) async {
     submissionStatus.value = SavingsSubmissionStatus.submitting;
     try {
@@ -179,7 +150,6 @@ class SavingsRepository {
       return hash;
     } on ApiRequestException catch (error) {
       submissionStatus.value = SavingsSubmissionStatus.failed;
-      // HTTP 422: the vault cannot cover the requested withdrawal amount.
       if (error.statusCode == 422) {
         throw InsufficientVaultFundsException(
           error.message,
@@ -200,16 +170,62 @@ class SavingsRepository {
     }
   }
 
-  /// Reverts the submission state to idle so the user can attempt the action
-  /// again without being stuck in a looping "pending" state.
+  /// Submits a signed trustline XDR to the backend with targeted error handling
+  /// and explicit API client method.
+  Future<String> submitTrustlineXdr(String signedXdr) async {
+    submissionStatus.value = SavingsSubmissionStatus.submitting;
+    final url = Uri.parse('$_baseUrl/api/transactions/submit');
+    try {
+      final response = await httpClient.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'signedXdr': signedXdr,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is Map && data.containsKey('hash')) {
+          submissionStatus.value = SavingsSubmissionStatus.succeeded;
+          return data['hash'] as String;
+        }
+        if (data is Map && data.containsKey('transactionHash')) {
+          submissionStatus.value = SavingsSubmissionStatus.succeeded;
+          return data['transactionHash'] as String;
+        }
+        submissionStatus.value = SavingsSubmissionStatus.failed;
+        throw const TransactionFailedException('Transaction hash not found in successful response');
+      } else {
+        submissionStatus.value = SavingsSubmissionStatus.failed;
+        final bodyData = jsonDecode(response.body);
+        final errorMessage = bodyData is Map ? (bodyData['detail'] ?? bodyData['message'] ?? 'Unknown error') : 'Unknown error';
+
+        if (errorMessage.toString().contains('trustline') || errorMessage.toString().contains('op_low_reserve') || errorMessage.toString().contains('op_already_exists')) {
+          throw TransactionFailedException('Trustline activation error: $errorMessage', statusCode: response.statusCode);
+        }
+        throw TransactionFailedException('Failed to submit trustline XDR: $errorMessage', statusCode: response.statusCode);
+      }
+    } on ApiException {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      rethrow;
+    } catch (e) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      if (e is TransactionFailedException) {
+        rethrow;
+      }
+      throw TransactionFailedException('Network or parsing error during trustline XDR submission: $e');
+    }
+  }
+
+  /// Reverts the submission state to idle so the user can attempt the action again.
   void resetSubmissionState() {
     submissionStatus.value = SavingsSubmissionStatus.idle;
   }
 
   /// Registers a newly generated Stellar public key with the backend.
-  ///
-  /// Authentication is supplied by [ApiClient.authTokenProvider]. A duplicate
-  /// address is surfaced as [ConflictException] rather than being retried.
   Future<void> registerStellarAddress(String stellarAddress) async {
     if (stellarAddress.trim().isEmpty) {
       throw ArgumentError.value(stellarAddress, 'stellarAddress', 'Cannot be empty.');
@@ -222,7 +238,6 @@ class SavingsRepository {
   }
 
   Future<SavingsDataModel> fetchSavingsDashboardData(String accountId) async {
-    // TODO: Call backend balance/apy endpoint via _apiClient.postWithRetry.
     return SavingsDataModel(balance: '0.0', apy: '0.0');
   }
 }
